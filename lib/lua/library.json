@@ -1,0 +1,15 @@
+{
+  "name": "lua",
+  "version": "5.4.x-vendored",
+  "description": "Vendored Lua interpreter core for embedded use (ESP32).",
+  "keywords": "lua, interpreter, vm",
+  "build": {
+    "srcFilter": [
+      "+<*.c>",
+      "+<*.h>",
+      "-<lua.c>"
+    ]
+  }
+}
+
+
