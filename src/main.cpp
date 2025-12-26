@@ -26,13 +26,15 @@ extern "C" {
 
 #include "M5Cardputer.h"
 #include "lua/bindings/lua_gfx.h"
+#include "lua/require_sd.h"
+#include "lua/bindings/lua_keyboard.h"
 
 // -------------------------------
 // Build-time configuration knobs
 // -------------------------------
 // Default Lua entrypoint on SD. Override with: -DCARDSTOCK_LUA_ENTRY=\"/my.lua\"
 #ifndef CARDSTOCK_LUA_ENTRY
-#define CARDSTOCK_LUA_ENTRY "/app.lua"
+#define CARDSTOCK_LUA_ENTRY "/launcher/main.lua"
 #endif
 
 // SD init pins. If you don't define these, the code falls back to SD.begin(CS).
@@ -57,6 +59,7 @@ struct LuaHost {
   String pending_path;
   bool reload_requested = false;
   uint32_t last_ms = 0;
+  String app_root;
 };
 
 static LuaHost g_host;
@@ -100,22 +103,25 @@ static bool init_sd_card() {
 }
 
 static bool read_entire_file_from_sd(const String& path, std::unique_ptr<uint8_t[]>& out_buf, size_t& out_len, String& out_err) {
-  File f = SD.open(path.c_str(), FILE_READ);
+  // ESP32 SD/FS paths are effectively absolute (no working-directory semantics).
+  // Root files often work without a leading '/', but subdirectories commonly won't.
+  const String normalized = (path.length() && path[0] == '/') ? path : (String("/") + path);
+  File f = SD.open(normalized.c_str(), FILE_READ);
   if (!f) {
-    out_err = "SD.open failed: " + path;
+    out_err = "SD.open failed: " + normalized;
     return false;
   }
 
   size_t sz = static_cast<size_t>(f.size());
   if (sz == 0) {
-    out_err = "Empty file: " + path;
+    out_err = "Empty file: " + normalized;
     f.close();
     return false;
   }
 
   std::unique_ptr<uint8_t[]> buf(new (std::nothrow) uint8_t[sz]);
   if (!buf) {
-    out_err = "OOM reading: " + path;
+    out_err = "OOM reading: " + normalized;
     f.close();
     return false;
   }
@@ -129,13 +135,39 @@ static bool read_entire_file_from_sd(const String& path, std::unique_ptr<uint8_t
   f.close();
 
   if (read_total != sz) {
-    out_err = "Short read: " + path;
+    out_err = "Short read: " + normalized;
     return false;
   }
 
   out_buf = std::move(buf);
   out_len = sz;
   return true;
+}
+
+static String normalize_abs_path(const String& p) {
+  if (!p.length()) return "";
+  String out = p;
+  if (out[0] != '/') out = String("/") + out;
+  while (out.length() > 1 && out[out.length() - 1] == '/') out.remove(out.length() - 1);
+  return out;
+}
+
+static String compute_app_root_for_entrypoint(const String& entry_script_path) {
+  const String p = normalize_abs_path(entry_script_path);
+
+  // Preferred: apps live at /apps/<appID>/...
+  if (p.startsWith("/apps/")) {
+    const int app_id_start = 6;  // strlen("/apps/")
+    const int slash_after_app_id = p.indexOf('/', app_id_start);
+    if (slash_after_app_id > app_id_start) {
+      return p.substring(0, slash_after_app_id);  // "/apps/<appID>"
+    }
+  }
+
+  // Fallback: use directory of the entrypoint (useful for launcher scripts too).
+  const int last_slash = p.lastIndexOf('/');
+  if (last_slash > 0) return p.substring(0, last_slash);
+  return "";
 }
 
 static int l_print_serial(lua_State* L) {
@@ -217,8 +249,15 @@ static bool lua_boot_and_load(LuaHost& host, const String& script_path) {
   host_set_for_lua(host.L, &host);
   luaL_openlibs(host.L);
 
+  // Install SD-backed require searcher and set app root scope for this entrypoint.
+  lua_cardstock_install_require(host.L);
+  host.app_root = compute_app_root_for_entrypoint(script_path);
+  lua_cardstock_set_app_root(host.L, host.app_root.c_str());
+
   // Register built-in modules (Lua: local gfx = require("gfx")).
   luaL_requiref(host.L, "gfx", luaopen_gfx, 1);
+  lua_pop(host.L, 1);  // pop returned module table
+  luaL_requiref(host.L, "keyboard", luaopen_keyboard, 1);
   lua_pop(host.L, 1);  // pop returned module table
 
   // Override print() to go to Serial (handy on embedded).
