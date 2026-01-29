@@ -28,6 +28,7 @@ extern "C" {
 #include "lua/bindings/lua_gfx.h"
 #include "lua/require_sd.h"
 #include "lua/bindings/lua_keyboard.h"
+#include "debug/SerialDebug.h"
 
 // -------------------------------
 // Build-time configuration knobs
@@ -63,6 +64,9 @@ struct LuaHost {
 };
 
 static LuaHost g_host;
+
+// Sprite for double-buffered debug mode indicator
+static LGFX_Sprite debug_sprite(&M5Cardputer.Display);
 
 static void* host_from_lua(lua_State* L) {
   // Store LuaHost* in the Lua "extra space" (Lua 5.4 feature).
@@ -108,7 +112,7 @@ static bool read_entire_file_from_sd(const String& path, std::unique_ptr<uint8_t
   const String normalized = (path.length() && path[0] == '/') ? path : (String("/") + path);
   File f = SD.open(normalized.c_str(), FILE_READ);
   if (!f) {
-    out_err = "SD.open failed: " + normalized;
+    out_err = "SD.open failed: " + normalized + "\nMake sure your SD card is formatted correctly.";
     return false;
   }
 
@@ -300,17 +304,23 @@ static bool lua_boot_and_load(LuaHost& host, const String& script_path) {
 }
 
 void setup() {
+  Serial.setRxBufferSize(2048);
   Serial.begin(115200);
   delay(50);
 
   auto cfg = M5.config();
   M5Cardputer.begin(cfg);
   M5Cardputer.Display.setRotation(1);
+  
+  // Initialize debug mode sprite (width, height, color depth)
+  debug_sprite.createSprite(60, 12);
+  debug_sprite.setTextSize(1);
+  
   ui_status("cardstock", "booting...");
 
   if (!init_sd_card()) {
     ui_status("SD init failed",
-              "Define CARDSTOCK_SD_* pins or check wiring");
+              "Check that the SD card is inserted, and that the system is installed correctly.");
     log_line("SD init failed. If you're on Cardputer, define CARDSTOCK_SD_CS/SCK/MISO/MOSI in build_flags.");
     return;
   }
@@ -323,46 +333,60 @@ void setup() {
 void loop() {
   M5Cardputer.update();
 
-  // If SD failed in setup, nothing to do.
-  if (!g_host.L) {
-    delay(250);
-    return;
-  }
+  if (g_host.L) { // If Lua is loaded, run the main loop
+    uint32_t now = millis();
+    float dt = (now - g_host.last_ms) / 1000.0f;
+    g_host.last_ms = now;
 
-  uint32_t now = millis();
-  float dt = (now - g_host.last_ms) / 1000.0f;
-  g_host.last_ms = now;
-
-  // tick(dt)
-  lua_pushnumber(g_host.L, dt);
-  if (!lua_call_optional(g_host.L, "tick", 1, 0)) {
-    // On error, keep Lua alive so user can see the message. (They can switch apps via reset.)
-    delay(250);
-    return;
-  }
-
-  // draw()
-  if (!lua_call_optional(g_host.L, "draw", 0, 0)) {
-    delay(250);
-    return;
-  }
-
-  // If Lua requested a new script, reload cleanly between frames.
-  if (g_host.reload_requested) {
-    String next = g_host.pending_path;
-    if (!next.length()) {
-      // If someone passed "", just ignore.
-      g_host.reload_requested = false;
-    } else {
-      ui_status("Switching to", next);
-      log_line(String("switch_app -> ") + next);
-      lua_boot_and_load(g_host, next);
-      // Note: lua_boot_and_load updates g_host fields.
+    // tick(dt)
+    lua_pushnumber(g_host.L, dt);
+    if (!lua_call_optional(g_host.L, "tick", 1, 0)) {
+      // On error, keep Lua alive so user can see the message. (They can switch apps via reset.)
+      delay(250);
+      return;
     }
+
+    // draw()
+    if (!lua_call_optional(g_host.L, "draw", 0, 0)) {
+      delay(250);
+      return;
+    }
+
+    // If Lua requested a new script, reload cleanly between frames.
+    if (g_host.reload_requested) {
+      String next = g_host.pending_path;
+      if (!next.length()) {
+        // If someone passed "", just ignore.
+        g_host.reload_requested = false;
+      } else {
+        ui_status("Switching to", next);
+        log_line(String("switch_app -> ") + next);
+        lua_boot_and_load(g_host, next);
+        // Note: lua_boot_and_load updates g_host fields.
+      }
+    }
+
+    // Keep loop responsive; adjust later if you add a fixed framerate.
+    delay(1);
   }
 
-  // Keep loop responsive; adjust later if you add a fixed framerate.
-  delay(1);
+  int serialResult = SerialDebug::handleSerialInput();
+  if (serialResult == 0x00) {
+    ui_status("Failed to process serial input", "Unknown command");
+    delay(1000);  // Show error briefly before continuing
+  } else if (serialResult == 0x04) {
+    Serial.println("Debug mode ENABLED");
+  }
+
+  if (SerialDebug::getDebugMode()) {
+    // Draw to sprite buffer first (double-buffering to prevent flicker)
+    debug_sprite.fillSprite(BLACK);
+    debug_sprite.setTextColor(WHITE, BLACK);
+    debug_sprite.drawString("DEV MODE", 5, 2.5);
+    
+    // Push sprite to display in one operation
+    debug_sprite.pushSprite(0, 0);
+  }
 }
 
 
