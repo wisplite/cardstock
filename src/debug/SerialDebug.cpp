@@ -16,6 +16,8 @@ State currentState = IDLE;
 
 uint8_t rxBuffer[1024];
 
+uint8_t ack[] = {0xAA, 0x06, 0x00, 0x00, 0x00}; // 0x06 is the universal ACK response
+
 namespace SerialDebug {
 
 int handleSerialInput() {
@@ -102,14 +104,14 @@ int processPacket(PacketHeader& header, uint8_t* data) {
                 return 0x00;
             }
             break;
-        case 0x04:
+        case 0x04: // Device wants to initiate dev mode
             debugMode = true;
-            Serial.println("DEBUG MODE SET TO TRUE");
+            Serial.write(ack, sizeof(ack));
             return 0x04;
             break;
-        case 0x05:
+        case 0x05: // Device wants to exit dev mode
             debugMode = false;
-            Serial.println("DEBUG MODE SET TO FALSE");
+            Serial.write(ack, sizeof(ack));
             return 0x05;
             break;
         default:
